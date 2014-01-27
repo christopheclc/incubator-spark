@@ -59,6 +59,23 @@ private[spark] class TaskSetManager(
   // CPUs to request per task
   val CPUS_PER_TASK = conf.getInt("spark.task.cpus", 1)
 
+  /* By default, not enabled.
+   * This is to ensure that on failure of a task, it does not get rescheduled on the same
+   * executor immediately.
+   *
+   * Scenario:
+   *
+   * In a bunch of cases we have observed, there is a race between reporting death of an executor
+   * and task scheduling : causing all reattempts to go to same executor (due to locality pref)
+   * resulting in all of them failing (via IllegalStateException, etc).
+   * This can happen due to other transient reasons too (memory pressure, etc) :
+   * instead of all re-attempts going to same host we try to spread to other hosts too.
+   *
+   * This delay ensure that even though we wait for another host, we do not indefinitely
+   * starve the task - but can attempt to re-execute in case the specified delay elapses.
+   */
+  val FAILED_EXECUTOR_RESCHEDULE_DELAY = conf.getLong("spark.task.failedRescheduleDelay", 0L)
+
   // Quantile of tasks at which to start speculation
   val SPECULATION_QUANTILE = conf.getDouble("spark.speculation.quantile", 0.75)
   val SPECULATION_MULTIPLIER = conf.getDouble("spark.speculation.multiplier", 1.5)
@@ -71,7 +88,9 @@ private[spark] class TaskSetManager(
   val numTasks = tasks.length
   val copiesRunning = new Array[Int](numTasks)
   val successful = new Array[Boolean](numTasks)
-  val numFailures = new Array[Int](numTasks)
+  private val numFailures = new Array[Int](numTasks)
+  // key is taskId, value is a Map of executor id to when it failed
+  private val failedExecutors = new HashMap[Int, HashMap[String, Long]]()
   val taskAttempts = Array.fill[List[TaskInfo]](numTasks)(Nil)
   var tasksSuccessful = 0
 
@@ -220,13 +239,20 @@ private[spark] class TaskSetManager(
    * This method also cleans up any tasks in the list that have already
    * been launched, since we want that to happen lazily.
    */
-  private def findTaskFromList(list: ArrayBuffer[Int]): Option[Int] = {
-    while (!list.isEmpty) {
-      val index = list.last
-      list.trimEnd(1)
-      if (copiesRunning(index) == 0 && !successful(index)) {
-        return Some(index)
-      }
+  private def findTaskFromList(execId: String, list: ArrayBuffer[Int]): Option[Int] = {
+    val iter = list.reverseIterator
+    var indexOffset = list.size
+    while (iter.hasNext) {
+      indexOffset -= 1
+
+      val index = iter.next()
+      if (! suppressFailedReexecution(execId, index)) {
+        // This should almost always be list.trimEnd(1) to remove tail
+        list.remove(indexOffset)
+        if (copiesRunning(index) == 0 && !successful(index)) {
+          return Some(index)
+        }
+      } // else reorder list ? move it to beginning of list ? Since this is a rare enough event, not complicating code.
     }
     None
   }
@@ -234,6 +260,21 @@ private[spark] class TaskSetManager(
   /** Check whether a task is currently running an attempt on a given host */
   private def hasAttemptOnHost(taskIndex: Int, host: String): Boolean = {
     taskAttempts(taskIndex).exists(_.host == host)
+  }
+
+  // Is this re-execution of a failed task on an executor it already failed in before FAILED_EXECUTOR_RESCHEDULE_DELAY
+  // has elapsed ?
+  private def suppressFailedReexecution(execId: String, taskId: Int): Boolean = {
+    // common case first
+    if (! failedExecutors.contains(taskId)) false else {
+      val failed = failedExecutors.get(taskId).get
+      if (failed.contains(execId)) {
+        // failure if not enough time has elapsed
+        val elapsedTime = clock.getTime() - failed.get(execId).get
+
+        elapsedTime < FAILED_EXECUTOR_RESCHEDULE_DELAY
+      } else false
+    }
   }
 
   /**
@@ -250,21 +291,25 @@ private[spark] class TaskSetManager(
       // Check for process-local or preference-less tasks; note that tasks can be process-local
       // on multiple nodes when we replicate cached blocks, as in Spark Streaming
       for (index <- speculatableTasks if !hasAttemptOnHost(index, host)) {
-        val prefs = tasks(index).preferredLocations
-        val executors = prefs.flatMap(_.executorId)
-        if (prefs.size == 0 || executors.contains(execId)) {
-          speculatableTasks -= index
-          return Some((index, TaskLocality.PROCESS_LOCAL))
+        if (! suppressFailedReexecution(execId, index)) {
+          val prefs = tasks(index).preferredLocations
+          val executors = prefs.flatMap(_.executorId)
+          if (prefs.size == 0 || executors.contains(execId)) {
+            speculatableTasks -= index
+            return Some((index, TaskLocality.PROCESS_LOCAL))
+          }
         }
       }
 
       // Check for node-local tasks
       if (TaskLocality.isAllowed(locality, TaskLocality.NODE_LOCAL)) {
         for (index <- speculatableTasks if !hasAttemptOnHost(index, host)) {
-          val locations = tasks(index).preferredLocations.map(_.host)
-          if (locations.contains(host)) {
-            speculatableTasks -= index
-            return Some((index, TaskLocality.NODE_LOCAL))
+          if (! suppressFailedReexecution(execId, index)) {
+            val locations = tasks(index).preferredLocations.map(_.host)
+            if (locations.contains(host)) {
+              speculatableTasks -= index
+              return Some((index, TaskLocality.NODE_LOCAL))
+            }
           }
         }
       }
@@ -273,10 +318,12 @@ private[spark] class TaskSetManager(
       if (TaskLocality.isAllowed(locality, TaskLocality.RACK_LOCAL)) {
         for (rack <- sched.getRackForHost(host)) {
           for (index <- speculatableTasks if !hasAttemptOnHost(index, host)) {
-            val racks = tasks(index).preferredLocations.map(_.host).map(sched.getRackForHost)
-            if (racks.contains(rack)) {
-              speculatableTasks -= index
-              return Some((index, TaskLocality.RACK_LOCAL))
+            if (! suppressFailedReexecution(execId, index)) {
+              val racks = tasks(index).preferredLocations.map(_.host).map(sched.getRackForHost)
+              if (racks.contains(rack)) {
+                speculatableTasks -= index
+                return Some((index, TaskLocality.RACK_LOCAL))
+              }
             }
           }
         }
@@ -285,8 +332,10 @@ private[spark] class TaskSetManager(
       // Check for non-local tasks
       if (TaskLocality.isAllowed(locality, TaskLocality.ANY)) {
         for (index <- speculatableTasks if !hasAttemptOnHost(index, host)) {
-          speculatableTasks -= index
-          return Some((index, TaskLocality.ANY))
+          if (! suppressFailedReexecution(execId, index)) {
+            speculatableTasks -= index
+            return Some((index, TaskLocality.ANY))
+          }
         }
       }
     }
@@ -301,12 +350,12 @@ private[spark] class TaskSetManager(
   private def findTask(execId: String, host: String, locality: TaskLocality.Value)
     : Option[(Int, TaskLocality.Value)] =
   {
-    for (index <- findTaskFromList(getPendingTasksForExecutor(execId))) {
+    for (index <- findTaskFromList(execId, getPendingTasksForExecutor(execId))) {
       return Some((index, TaskLocality.PROCESS_LOCAL))
     }
 
     if (TaskLocality.isAllowed(locality, TaskLocality.NODE_LOCAL)) {
-      for (index <- findTaskFromList(getPendingTasksForHost(host))) {
+      for (index <- findTaskFromList(execId, getPendingTasksForHost(host))) {
         return Some((index, TaskLocality.NODE_LOCAL))
       }
     }
@@ -314,19 +363,19 @@ private[spark] class TaskSetManager(
     if (TaskLocality.isAllowed(locality, TaskLocality.RACK_LOCAL)) {
       for {
         rack <- sched.getRackForHost(host)
-        index <- findTaskFromList(getPendingTasksForRack(rack))
+        index <- findTaskFromList(execId, getPendingTasksForRack(rack))
       } {
         return Some((index, TaskLocality.RACK_LOCAL))
       }
     }
 
     // Look for no-pref tasks after rack-local tasks since they can run anywhere.
-    for (index <- findTaskFromList(pendingTasksWithNoPrefs)) {
+    for (index <- findTaskFromList(execId, pendingTasksWithNoPrefs)) {
       return Some((index, TaskLocality.PROCESS_LOCAL))
     }
 
     if (TaskLocality.isAllowed(locality, TaskLocality.ANY)) {
-      for (index <- findTaskFromList(allPendingTasks)) {
+      for (index <- findTaskFromList(execId, allPendingTasks)) {
         return Some((index, TaskLocality.ANY))
       }
     }
@@ -387,6 +436,7 @@ private[spark] class TaskSetManager(
         case _ =>
       }
     }
+
     None
   }
 
@@ -452,6 +502,8 @@ private[spark] class TaskSetManager(
       logInfo("Ignorning task-finished event for TID " + tid + " because task " +
         index + " has already completed successfully")
     }
+
+    failedExecutors.remove(index)
   }
 
   /**
@@ -535,6 +587,7 @@ private[spark] class TaskSetManager(
       addPendingTask(index)
       if (state != TaskState.KILLED) {
         numFailures(index) += 1
+        failedExecutors.getOrElseUpdate(index, new HashMap[String, Long]()).put(info.executorId, clock.getTime())
         if (numFailures(index) >= maxTaskFailures) {
           logError("Task %s:%d failed %d times; aborting job".format(
             taskSet.id, index, maxTaskFailures))

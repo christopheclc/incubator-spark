@@ -25,7 +25,7 @@ import org.scalatest.FunSuite
 import org.apache.spark._
 import org.apache.spark.executor.TaskMetrics
 import java.nio.ByteBuffer
-import org.apache.spark.util.{Utils, FakeClock}
+import org.apache.spark.util.{SystemClock, Utils, FakeClock}
 
 class FakeDAGScheduler(taskScheduler: FakeClusterScheduler) extends DAGScheduler(taskScheduler) {
   override def taskStarted(task: Task[_], taskInfo: TaskInfo) {
@@ -299,6 +299,102 @@ class TaskSetManagerSuite extends FunSuite with LocalSparkContext with Logging {
     }
   }
 
+
+  test("repeated failures should cause task set to pick a different host : inspite of task locality pref") {
+    // 0.3 second delay : this test will take min 0.3s - this is to ensure test gets run even if machine is loaded
+    val rescheduleDelay = 300L
+    val conf = new SparkConf().
+      set("spark.task.failedRescheduleDelay", rescheduleDelay.toString).
+      // dont wait to jump locality levels in this test
+      set("spark.locality.wait", "0")
+
+    sc = new SparkContext("local", "test", conf)
+    // two executors on same host, one on different.
+    val sched = new FakeClusterScheduler(sc, ("exec1", "host1"), ("exec1.1", "host1"), ("exec2", "host2"))
+    // affinity to exec1 on host1 - which we will fail.
+    val taskSet = createTaskSet(1, Seq(TaskLocation("host1", "exec1")))
+    // we need actual time measurement
+    val clock = SystemClock
+    val manager = new TaskSetManager(sched, taskSet, MAX_TASK_FAILURES, clock)
+
+    // This tests assumes MAX_TASK_FAILURES == 4
+    assert (MAX_TASK_FAILURES == 4)
+
+    {
+      val offerResult = manager.resourceOffer("exec1", "host1", 1, TaskLocality.PROCESS_LOCAL)
+      assert(offerResult.isDefined, "Expect resource offer to return a task")
+
+      assert(offerResult.get.index === 0)
+      assert(offerResult.get.executorId == "exec1")
+
+      // Cause it to fail : failure 1
+      manager.handleFailedTask(offerResult.get.taskId, TaskState.FINISHED, Some(TaskResultLost))
+      assert(!sched.taskSetsFailed.contains(taskSet.id))
+    }
+
+    // Now we MUST NOT get it back
+    {
+      val offerResult = manager.resourceOffer("exec1", "host1", 1, TaskLocality.ANY)
+      assert(offerResult.isEmpty, "Expect resource offer to NOT return a task")
+    }
+
+    // Gobble it up via exec1.1 and fail that too
+    {
+      val offerResult = manager.resourceOffer("exec1.1", "host1", 1, TaskLocality.ANY)
+      assert(offerResult.isDefined, "Expect resource offer to return a task for exec1.1, offerResult = " + offerResult)
+
+      assert(offerResult.get.index === 0)
+      assert(offerResult.get.executorId == "exec1.1")
+
+      // Cause it to fail : failure 2
+      manager.handleFailedTask(offerResult.get.taskId, TaskState.FINISHED, Some(TaskResultLost))
+      assert(!sched.taskSetsFailed.contains(taskSet.id))
+    }
+
+    // 1.1 must also fail now.
+    {
+      val offerResult = manager.resourceOffer("exec1.1", "host1", 1, TaskLocality.ANY)
+      assert(offerResult.isEmpty, "Expect resource offer to NOT return a task")
+    }
+
+    // Now it is turn of host2
+    {
+      val offerResult = manager.resourceOffer("exec2", "host2", 1, TaskLocality.ANY)
+      assert(offerResult.isDefined, "Expect resource offer to return a task")
+
+      assert(offerResult.get.index === 0)
+      assert(offerResult.get.executorId == "exec2")
+
+      // Cause it to fail : failure 3
+      manager.handleFailedTask(offerResult.get.taskId, TaskState.FINISHED, Some(TaskResultLost))
+      assert(!sched.taskSetsFailed.contains(taskSet.id))
+    }
+
+    // and fail host2
+    {
+      val offerResult = manager.resourceOffer("exec2", "host2", 1, TaskLocality.ANY)
+      assert(offerResult.isEmpty, "Expect resource offer to NOT return a task")
+    }
+
+    // Wait for rescheduledDelay, and retry : just to be sure, we wait slightly longer to ensure this : not bothering with
+    // trying to enforce the wait too much for now.
+    Thread.sleep(rescheduleDelay + 100)
+
+    // Should work again !
+    {
+      val offerResult = manager.resourceOffer("exec1", "host1", 1, TaskLocality.PROCESS_LOCAL)
+      assert(offerResult.isDefined, "Expect resource offer to return a task")
+
+      assert(offerResult.get.index === 0)
+      assert(offerResult.get.executorId == "exec1")
+
+      // Cause it to fail : failure 4
+      manager.handleFailedTask(offerResult.get.taskId, TaskState.FINISHED, Some(TaskResultLost))
+    }
+
+    // we have failed the same task 4 times now (which is MAX_TASK_FAILURES) : it should now be in taskSetsFailed
+    assert(sched.taskSetsFailed.contains(taskSet.id))
+  }
 
   /**
    * Utility method to create a TaskSet, potentially setting a particular sequence of preferred
