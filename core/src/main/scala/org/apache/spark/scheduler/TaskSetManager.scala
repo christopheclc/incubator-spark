@@ -519,6 +519,10 @@ private[spark] class TaskSetManager(
     val index = info.index
     info.markFailed()
     var failureReason = "unknown"
+    // Always adding ... we did see a few failures inspite of the previous changes, so.
+    val addToFailedExecutor = () => {
+      failedExecutors.getOrElseUpdate(index, new HashMap[String, Long]()).put(info.executorId, clock.getTime())
+    }
     if (!successful(index)) {
       logWarning("Lost TID %s (task %s:%d)".format(tid, taskSet.id, index))
       copiesRunning(index) -= 1
@@ -532,11 +536,14 @@ private[spark] class TaskSetManager(
           tasksSuccessful += 1
           sched.taskSetFinished(this)
           removeAllRunningTasks()
+          // Not adding to failed for FetchFailed.
           return
 
         case TaskKilled =>
           logWarning("Task %d was killed.".format(tid))
           sched.dagScheduler.taskEnded(tasks(index), reason.get, null, null, info, null)
+          // Add to failed - even if killed.
+          addToFailedExecutor()
           return
 
         case ef: ExceptionFailure =>
@@ -548,10 +555,12 @@ private[spark] class TaskSetManager(
               taskSet.id, index, ef.description))
             abort("Task %s:%s had a not serializable result: %s".format(
               taskSet.id, index, ef.description))
+            // Add to failed : does not matter if NotSerializable or not : does not help, but let it be consistent
+            addToFailedExecutor()
             return
           }
           val key = ef.description
-          failureReason = "Exception failure: %s".format(ef.description)
+          failureReason = "Exception failure in TID %s on host %s: %s".format(tid, info.host, ef.description)
           val now = clock.getTime()
           val (printFull, dupCount) = {
             if (recentExceptions.contains(key)) {
@@ -581,13 +590,17 @@ private[spark] class TaskSetManager(
           logWarning(failureReason)
           sched.dagScheduler.taskEnded(tasks(index), TaskResultLost, null, null, info, null)
 
-        case _ => {}
+        case _ =>
+          // We are seeing 'unknown' in our logs which does not help debugging ..
+          failureReason = "TID %s on host %s failed for unknown reason %s".format(tid, info.host, reason)
       }
+      // Add to failed for everything else.
+      addToFailedExecutor()
+
       // On non-fetch failures, re-enqueue the task as pending for a max number of retries
       addPendingTask(index)
       if (state != TaskState.KILLED) {
         numFailures(index) += 1
-        failedExecutors.getOrElseUpdate(index, new HashMap[String, Long]()).put(info.executorId, clock.getTime())
         if (numFailures(index) >= maxTaskFailures) {
           logError("Task %s:%d failed %d times; aborting job".format(
             taskSet.id, index, maxTaskFailures))
