@@ -330,17 +330,22 @@ class TaskSetManagerSuite extends FunSuite with LocalSparkContext with Logging {
       // Cause it to fail : failure 1
       manager.handleFailedTask(offerResult.get.taskId, TaskState.FINISHED, Some(TaskResultLost))
       assert(!sched.taskSetsFailed.contains(taskSet.id))
+
+      assert (manager.resourceOffer("exec1", "host1", 1, TaskLocality.PROCESS_LOCAL).isEmpty)
+      assert (manager.resourceOffer("exec1", "host1", 1, TaskLocality.NODE_LOCAL).isEmpty)
+      assert (manager.resourceOffer("exec1", "host1", 1, TaskLocality.RACK_LOCAL).isEmpty)
+      assert (manager.resourceOffer("exec1", "host1", 1, TaskLocality.ANY).isEmpty)
     }
 
     // Now we MUST NOT get it back
     {
-      val offerResult = manager.resourceOffer("exec1", "host1", 1, TaskLocality.ANY)
+      val offerResult = manager.resourceOffer("exec1", "host1", 1, TaskLocality.PROCESS_LOCAL)
       assert(offerResult.isEmpty, "Expect resource offer to NOT return a task")
     }
 
     // Gobble it up via exec1.1 and fail that too
     {
-      val offerResult = manager.resourceOffer("exec1.1", "host1", 1, TaskLocality.ANY)
+      val offerResult = manager.resourceOffer("exec1.1", "host1", 1, TaskLocality.NODE_LOCAL)
       assert(offerResult.isDefined, "Expect resource offer to return a task for exec1.1, offerResult = " + offerResult)
 
       assert(offerResult.get.index === 0)
@@ -353,7 +358,7 @@ class TaskSetManagerSuite extends FunSuite with LocalSparkContext with Logging {
 
     // 1.1 must also fail now.
     {
-      val offerResult = manager.resourceOffer("exec1.1", "host1", 1, TaskLocality.ANY)
+      val offerResult = manager.resourceOffer("exec1.1", "host1", 1, TaskLocality.NODE_LOCAL)
       assert(offerResult.isEmpty, "Expect resource offer to NOT return a task")
     }
 
@@ -387,6 +392,8 @@ class TaskSetManagerSuite extends FunSuite with LocalSparkContext with Logging {
 
       assert(offerResult.get.index === 0)
       assert(offerResult.get.executorId == "exec1")
+
+      assert (manager.resourceOffer("exec1", "host1", 1, TaskLocality.PROCESS_LOCAL).isEmpty)
 
       // Cause it to fail : failure 4
       manager.handleFailedTask(offerResult.get.taskId, TaskState.FINISHED, Some(TaskResultLost))
