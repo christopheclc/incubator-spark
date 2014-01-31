@@ -65,7 +65,10 @@ private[spark] class JobProgressListener(val sc: SparkContext) extends SparkList
 
   override def onStageCompleted(stageCompleted: SparkListenerStageCompleted) = synchronized {
     val stage = stageCompleted.stage
-    poolToActiveStages(stageIdToPool(stage.stageId)) -= stage
+    if (stageIdToPool.contains(stage.stageId) &&
+        poolToActiveStages.contains(stageIdToPool(stage.stageId))) {
+      poolToActiveStages(stageIdToPool(stage.stageId)) -= stage
+    }
     activeStages -= stage
     completedStages += stage
     trimIfNecessary(completedStages)
@@ -215,7 +218,11 @@ private[spark] class JobProgressListener(val sc: SparkContext) extends SparkList
             val stageInfo = activeStages.filter(s => s.stageId == stage.id).headOption
             stageInfo.foreach {s =>
               activeStages -= s
-              poolToActiveStages(stageIdToPool(stage.id)) -= s
+              if (stageIdToPool.contains(stage.id) &&
+                poolToActiveStages.contains(stageIdToPool(stage.id))) {
+
+                poolToActiveStages(stageIdToPool(stage.id)) -= s
+              }
               failedStages += s
               trimIfNecessary(failedStages)
             }
