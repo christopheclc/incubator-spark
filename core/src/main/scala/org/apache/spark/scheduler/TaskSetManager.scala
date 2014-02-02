@@ -526,6 +526,7 @@ private[spark] class TaskSetManager(
     val index = info.index
     info.markFailed()
     var failureReason = "unknown"
+    var executorShutdown = false
     // Always adding ... we did see a few failures inspite of the previous changes, so.
     val addToFailedExecutor = () => {
       failedExecutors.getOrElseUpdate(index, new HashMap[String, Long]()).put(info.executorId, clock.getTime())
@@ -567,12 +568,9 @@ private[spark] class TaskSetManager(
             return
           }
           if (isShutdownException(ef)) {
-            // If the task failed due to shutdown, ignore the failure : too many tasksets failing due to this.
-            logError("Task %s:%s failed due to node shutdown. Ignoring : %s".format(
-              taskSet.id, index, ef.description))
-            addToFailedExecutor()
-            return
+            executorShutdown = true
           }
+
           val key = ef.description
           failureReason = "Exception failure in TID %s on host %s: %s".format(tid, info.host, ef.description)
           val now = clock.getTime()
@@ -613,7 +611,8 @@ private[spark] class TaskSetManager(
 
       // On non-fetch failures, re-enqueue the task as pending for a max number of retries
       addPendingTask(index)
-      if (state != TaskState.KILLED) {
+
+      if (! executorShutdown && state != TaskState.KILLED) {
         numFailures(index) += 1
         if (numFailures(index) >= maxTaskFailures) {
           logError("Task %s:%d failed %d times; aborting job".format(
