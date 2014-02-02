@@ -506,6 +506,13 @@ private[spark] class TaskSetManager(
     failedExecutors.remove(index)
   }
 
+  // HACK: Is there a better way to determine this ? A lot of tasksets are failing due to this ...
+  private def isShutdownException(failure: ExceptionFailure): Boolean = {
+    failure.className == classOf[IllegalStateException].getName &&
+      // failure.description.toLowerCase.contains("shutdown in progress, cannot add a shutdownhook")
+      failure.description.toLowerCase.contains("shutdown in progress")
+  }
+
   /**
    * Marks the task as failed, re-adds it to the list of pending tasks, and notifies the
    * DAG Scheduler.
@@ -556,6 +563,13 @@ private[spark] class TaskSetManager(
             abort("Task %s:%s had a not serializable result: %s".format(
               taskSet.id, index, ef.description))
             // Add to failed : does not matter if NotSerializable or not : does not help, but let it be consistent
+            addToFailedExecutor()
+            return
+          }
+          if (isShutdownException(ef)) {
+            // If the task failed due to shutdown, ignore the failure : too many tasksets failing due to this.
+            logError("Task %s:%s failed due to node shutdown. Ignoring : %s".format(
+              taskSet.id, index, ef.description))
             addToFailedExecutor()
             return
           }
