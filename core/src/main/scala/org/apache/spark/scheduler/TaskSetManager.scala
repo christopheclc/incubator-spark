@@ -579,7 +579,6 @@ private[spark] class TaskSetManager(
           sched.dagScheduler.taskEnded(tasks(index), TaskResultLost, null, null, info, null)
 
         case _ =>
-          // We are seeing 'unknown' in our logs which does not help debugging ..
           failureReason = "TID %s on host %s failed for unknown reason %s".format(tid, info.host, reason)
       }
       // Add to failed for everything else.
