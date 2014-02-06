@@ -65,7 +65,8 @@ private[spark] class TaskSetManager(
    * this temporarily prevents a task from re-launching on an executor where
    * it just failed.
    */
-  private[this] val EXECUTOR_TASK_BLACKLIST_TIMEOUT = conf.getLong("spark.task.executorBlacklistTimeout", 0L)
+  private[this] val EXECUTOR_TASK_BLACKLIST_TIMEOUT = 
+    conf.getLong("spark.task.executorBlacklistTimeout", 0L)
 
   // Quantile of tasks at which to start speculation
   val SPECULATION_QUANTILE = conf.getDouble("spark.speculation.quantile", 0.75)
