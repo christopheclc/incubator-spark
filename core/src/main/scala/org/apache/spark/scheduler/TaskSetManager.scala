@@ -531,8 +531,6 @@ private[spark] class TaskSetManager(
         case TaskKilled =>
           logWarning("Task %d was killed.".format(tid))
           sched.dagScheduler.taskEnded(tasks(index), reason.get, null, null, info, null)
-          // Add to failed - even if killed :
-          addToFailedExecutor()
           return
 
         case ef: ExceptionFailure =>
@@ -544,8 +542,6 @@ private[spark] class TaskSetManager(
               taskSet.id, index, ef.description))
             abort("Task %s:%s had a not serializable result: %s".format(
               taskSet.id, index, ef.description))
-            // Add to failed even for NotSerializable: adding for consistency.
-            addToFailedExecutor()
             return
           }
 
