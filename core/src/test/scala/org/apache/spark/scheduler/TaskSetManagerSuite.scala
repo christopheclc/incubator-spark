@@ -304,7 +304,7 @@ class TaskSetManagerSuite extends FunSuite with LocalSparkContext with Logging {
     // 0.3 second delay : this test will take min 0.3s - this is to ensure test gets run even if machine is loaded
     val rescheduleDelay = 300L
     val conf = new SparkConf().
-      set("spark.task.failedRescheduleDelay", rescheduleDelay.toString).
+      set("spark.task.executorBlacklistTimeout", rescheduleDelay.toString).
       // dont wait to jump locality levels in this test
       set("spark.locality.wait", "0")
 
