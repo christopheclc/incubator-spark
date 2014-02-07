@@ -220,7 +220,6 @@ private[spark] class JobProgressListener(val sc: SparkContext) extends SparkList
               activeStages -= s
               if (stageIdToPool.contains(stage.id) &&
                 poolToActiveStages.contains(stageIdToPool(stage.id))) {
-
                 poolToActiveStages(stageIdToPool(stage.id)) -= s
               }
               failedStages += s
