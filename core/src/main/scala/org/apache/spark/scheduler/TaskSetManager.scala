@@ -509,7 +509,8 @@ private[spark] class TaskSetManager(
     var failureReason = "unknown"
 
     val addToFailedExecutor = () => {
-      failedExecutors.getOrElseUpdate(index, new HashMap[String, Long]()).put(info.executorId, clock.getTime())
+      failedExecutors.getOrElseUpdate(index, new HashMap[String, Long]()).
+        put(info.executorId, clock.getTime())
     }
     if (!successful(index)) {
       logWarning("Lost TID %s (task %s:%d)".format(tid, taskSet.id, index))
@@ -530,7 +531,7 @@ private[spark] class TaskSetManager(
         case TaskKilled =>
           logWarning("Task %d was killed.".format(tid))
           sched.dagScheduler.taskEnded(tasks(index), reason.get, null, null, info, null)
-          // Add to failed - even if killed.
+          // Add to failed - even if killed :
           addToFailedExecutor()
           return
 
@@ -543,7 +544,7 @@ private[spark] class TaskSetManager(
               taskSet.id, index, ef.description))
             abort("Task %s:%s had a not serializable result: %s".format(
               taskSet.id, index, ef.description))
-            // Add to failed : does not matter if NotSerializable or not : does not help, but let it be consistent
+            // Add to failed even for NotSerializable: adding for consistency.
             addToFailedExecutor()
             return
           }
@@ -580,7 +581,7 @@ private[spark] class TaskSetManager(
           sched.dagScheduler.taskEnded(tasks(index), TaskResultLost, null, null, info, null)
 
         case _ =>
-          failureReason = "TID %s on host %s failed for unknown reason %s".format(tid, info.host, reason)
+          failureReason = "TID %s on host %s failed for unknown reason".format(tid, info.host)
       }
       // Add to failed for everything else.
       addToFailedExecutor()
