@@ -525,7 +525,7 @@ private[spark] class TaskSetManager(
           tasksSuccessful += 1
           sched.taskSetFinished(this)
           removeAllRunningTasks()
-          // Not adding to failed for FetchFailed.
+          // Not adding to failed executors for FetchFailed.
           return
 
         case TaskKilled =>
@@ -550,7 +550,8 @@ private[spark] class TaskSetManager(
           }
 
           val key = ef.description
-          failureReason = "Exception failure in TID %s on host %s: %s".format(tid, info.host, ef.description)
+          failureReason = "Exception failure in TID %s on host %s: %s".format(
+            tid, info.host, ef.description)
           val now = clock.getTime()
           val (printFull, dupCount) = {
             if (recentExceptions.contains(key)) {
